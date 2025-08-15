@@ -1,2 +1,6 @@
 .env
 *.csv
+data/processed/*.parquet
+
+
+
