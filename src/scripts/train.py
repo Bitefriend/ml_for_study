@@ -96,3 +96,56 @@ pipelines = {
     "lgbm_model":    pipe_lgbm_model,
     "xgb_model":     pipe_xgb_model,
 }
+
+
+
+
+
+
+# --- 교차 검증 (Cross-Validation)으로 모든 모델 평가 ---
+print("\n--- 모든 모델 교차 검증 시작 ---")
+
+# StratifiedKFold를 사용하여 레이블 비율을 유지하며 5-fold 교차 검증 수행
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+# 모델별 결과를 저장할 딕셔너리
+results = {}
+
+# 딕셔너리에 있는 모든 파이프라인 순회
+for name, pipeline in pipelines.items():
+    print(f"\n모델 훈련 시작: {name}")
+    
+    # OOF(Out-Of-Fold) 예측을 저장할 리스트
+    oof_preds_proba = []
+    oof_labels = []
+
+    # 교차 검증
+    for i, (train_index, val_index) in enumerate(skf.split(X, y)):
+        print(f"  - Fold {i+1} / 5")
+        
+        X_train, X_val = X.iloc[train_index], X.iloc[val_index]
+        y_train, y_val = y.iloc[train_index], y.iloc[val_index]
+        
+        # 파이프라인을 훈련 데이터로 학습
+        pipeline.fit(X_train, y_train)
+        
+        # 검증 데이터에 대한 예측 확률 계산
+        val_preds_proba = pipeline.predict_proba(X_val)[:, 1]
+        
+        # OOF 예측 및 레이블 추가
+        oof_preds_proba.extend(val_preds_proba)
+        oof_labels.extend(y_val)
+    
+    # 전체 OOF 예측에 대한 ROC-AUC 점수 계산
+    oof_score = roc_auc_score(oof_labels, oof_preds_proba)
+    results[name] = oof_score
+    
+    print(f"  -> {name} 평균 ROC-AUC: {oof_score:.4f}")
+
+# 최종 결과 출력
+print("\n--- 교차 검증 결과 요약 ---")
+for name, score in sorted(results.items(), key=lambda item: item[1], reverse=True):
+    print(f"{name:<15}: {score:.4f}")
+print("------------------------------")
+
+
