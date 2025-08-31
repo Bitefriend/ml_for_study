@@ -1,166 +1,195 @@
+# XGBoost(GPU) 5-Fold + GPU 사용률 모니터 (QuantileDMatrix ref + max_bin 일치)
+# data/raw/train.csv  [ID, URL, label]
+
+import os, sys, time, threading
 import numpy as np
 import pandas as pd
-
+from packaging import version
 from sklearn.model_selection import StratifiedKFold
-from sklearn.decomposition import TruncatedSVD
-from sklearn.feature_extraction.text import HashingVectorizer, TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.svm import LinearSVC
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.pipeline import Pipeline
+from sklearn.feature_extraction.text import HashingVectorizer
 from sklearn.metrics import roc_auc_score
-from sklearn.ensemble import RandomForestClassifier
-
-import lightgbm as lgb
 import xgboost as xgb
 
-# --- 데이터 로드 (열 이름은 사용자 데이터에 맞게 교체 필요) ---
-# train.csv: [ID, URL, label] / test.csv: [ID, URL] 
-train = pd.read_csv("data/raw/train.csv")  
-test  = pd.read_csv("data/raw/test.csv")   
-X = train["URL"]                           
-y = train["label"] 
+# --- NVML 경로 힌트(Windows) ---
+NVML_CANDIDATES = [
+    r"C:\Program Files\NVIDIA Corporation\NVSMI\nvml.dll",
+    r"C:\Windows\System32\nvml.dll",
+]
+for pth in NVML_CANDIDATES:
+    if os.path.exists(pth):
+        os.environ.setdefault("NVML_DLL", pth)
+        try:
+            os.add_dll_directory(os.path.dirname(pth))
+        except Exception:
+            pass
+        break
 
-# --- 벡터라이저 (문자 3–5 gram, 해시 피처 수는 예시값) ---
-# vec = HashingVectorizer(analyzer='char', ngram_range=(3,5),
-#                         n_features=2**18, alternate_sign=False, lowercase=False)
+def log_env():
+    print(f"[ENV] Python={sys.version.split()[0]}  XGBoost={xgb.__version__}")
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        n = pynvml.nvmlDeviceGetCount()
+        gpus = []
+        for i in range(n):
+            h = pynvml.nvmlDeviceGetHandleByIndex(i)
+            name = pynvml.nvmlDeviceGetName(h)
+            gpus.append(name.decode() if isinstance(name, bytes) else str(name))
+        print(f"[ENV] NVML GPUs: {gpus}")
+        pynvml.nvmlShutdown()
+    except Exception as e:
+        print(f"[ENV] NVML check skipped ({type(e).__name__}: {e})")
 
-# -- 벡터라이저들 (모델 성향에 맞춰 분리) --
-vec_hash_35 = HashingVectorizer(        # 선형 모델용 (희박·초고차원에 강함)
-    analyzer='char', ngram_range=(3, 5),
-    n_features=2**18, alternate_sign=False, lowercase=False
-)
-vec_tfidf_linear = TfidfVectorizer(     # 선형 모델 대안
-    analyzer='char', ngram_range=(3, 5),
-    sublinear_tf=True, lowercase=False, max_features=None
-)
-vec_tfidf_tree = TfidfVectorizer(       # 트리 계열용 (차원 제한 권장)
-    analyzer='char', ngram_range=(3, 4),
-    sublinear_tf=True, lowercase=False, max_features=50000
-)
-svd_300 = TruncatedSVD(                 # (선택) 트리계열 안정화용 차원 축소
-    n_components=300, random_state=4321
-)
+def xgb_gpu_ok() -> bool:
+    try:
+        X = np.random.RandomState(0).rand(32, 4).astype(np.float32)
+        y = np.random.RandomState(0).randint(0, 2, 32)
+        dtrain = xgb.DMatrix(X, label=y)
+        params = {"max_depth": 1, "eta": 1.0, "objective": "binary:logistic", "nthread": 1}
+        if version.parse(xgb.__version__) >= version.parse("2.0.0"):
+            params.update(device="cuda", tree_method="hist")
+        else:
+            params.update(tree_method="gpu_hist", predictor="gpu_predictor", gpu_id=0)
+        xgb.train(params, dtrain, num_boost_round=1)
+        print("[CHK] XGBoost(GPU) OK")
+        return True
+    except Exception as e:
+        print(f"[CHK] XGBoost GPU not available ({type(e).__name__}: {e})")
+        return False
 
-print("X dtype:", X.dtype, " / sample:", X.iloc[:3].tolist())
-print("y dtype:", y.dtype, " / counts:\n", y.value_counts())
-print((y.astype(str) + " 인식").iloc[:5].tolist())
+class GPUMonitor:
+    def __init__(self, index: int = 0, interval: float = 0.5):
+        self.index = index
+        self.interval = interval
+        self.samples = []
+        self._stop = False
+        self.enabled = False
+    def start(self):
+        try:
+            import pynvml
+            self.pynvml = pynvml
+            self.pynvml.nvmlInit()
+            self.handle = self.pynvml.nvmlDeviceGetHandleByIndex(self.index)
+            self.enabled = True
+            def _run():
+                while not self._stop:
+                    util = self.pynvml.nvmlDeviceGetUtilizationRates(self.handle)
+                    mem = self.pynvml.nvmlDeviceGetMemoryInfo(self.handle)
+                    self.samples.append((time.time(), util.gpu, util.memory, mem.used, mem.total))
+                    time.sleep(self.interval)
+            self.t = threading.Thread(target=_run, daemon=True)
+            self.t.start()
+        except Exception as e:
+            print(f"[MON] disabled ({type(e).__name__}: {e})")
+    def stop(self, prefix=""):
+        if not self.enabled: return
+        self._stop = True
+        self.t.join()
+        self.pynvml.nvmlShutdown()
+        self.summary(prefix)
+    def summary(self, prefix=""):
+        if not self.samples:
+            print(prefix + "[MON] no samples"); return
+        arr = np.asarray(self.samples, dtype=np.float64)
+        gpu, memp, used, total = arr[:,1], arr[:,2], arr[:,3], arr[:,4][0]
+        print(prefix + f"[MON] GPU% avg/max: {gpu.mean():.1f}/{gpu.max():.1f} | "
+              f"Mem% avg/max: {memp.mean():.1f}/{memp.max():.1f} | "
+              f"Mem(GB) avg/max: {used.mean()/1e9:.2f}/{used.max()/1e9:.2f} of {total/1e9:.2f}")
 
+def main():
+    log_env()
+    assert xgb_gpu_ok(), "XGBoost GPU가 동작하지 않습니다."
 
-# --- 모델 정의 (이 부분만 추가) ---
+    # ---- 데이터 로드 ----
+    train = pd.read_csv("data/raw/train.csv")  # [ID, URL, label]
+    X_text = train["URL"].fillna("").astype(str)
+    y = train["label"].astype(int)
+    print("y counts:\n", y.value_counts())
 
-# 1. 로지스틱 회귀 모델 (기본 모델)
-log_reg_model = LogisticRegression(solver='liblinear', random_state=42)
-# 권장 추가: penalty='l2' or 'elasticnet', C=**예시**, max_iter=**예시**, class_weight='balanced'
-print("\n로지스틱 회귀 모델 정의 완료.")
+    # ---- 해싱 전처리 (차원 축소 & 이진화) ----
+    vec = HashingVectorizer(
+        analyzer="char",
+        ngram_range=(3, 4),
+        n_features=2**15,         # 32,768
+        alternate_sign=False,
+        lowercase=False,
+        binary=True,
+        dtype=np.float32,
+    )
+    X_all = vec.transform(X_text)
+    print("[INFO] Hashed features shape:", X_all.shape, "| dtype:", X_all.dtype)
 
-# 2. 선형 SVM 모델 (확률 보정이 필요)
-svc_model = LinearSVC(random_state=42)
- # 권장 추가: C=**예시**, loss='squared_hinge', max_iter=**예시**, tol=**예시**, class_weight='balanced'
-print("선형 SVM 모델 정의 완료.")
+    # ---- 공통 상수: max_bin 일관 유지 ----
+    MAX_BIN = 64  # 필요시 32/128로 조정
 
-# 3. 랜덤 포레스트 모델 (앙상블 모델)
-rf_model = RandomForestClassifier(random_state=42)
-    # 권장 추가: n_estimators=**예시**, max_depth=**예시**, min_samples_split=**예시**,
-    #           min_samples_leaf=**예시**, max_features='sqrt', class_weight='balanced_subsample', n_jobs=-1
-print("랜덤 포레스트 모델 정의 완료.")
-
-# 4. LightGBM 모델 (부스팅 계열, 설치 후 사용)
-lgbm_model = lgb.LGBMClassifier(random_state=42)
-    # 권장 추가: n_estimators=**예시**, learning_rate=**예시**, num_leaves=**예시**, max_depth=**예시**,
-    #           feature_fraction=**예시**, bagging_fraction=**예시**, bagging_freq=**예시**,
-    #           min_data_in_leaf=**예시**, lambda_l1=**예시**, lambda_l2=**예시**,
-    #           objective='binary', metric='auc', is_unbalance=True, num_threads=-1
-print("LightGBM 모델 정의 완료.")
-
-# 5. XGBoost 모델 (부스팅 계열, 설치 후 사용)
-xgb_model = xgb.XGBClassifier(random_state=42)
-# 권장 추가: n_estimators=**예시**, learning_rate=**예시**, max_depth=**예시**, min_child_weight=**예시**,
-    #           subsample=**예시**, colsample_bytree=**예시**, reg_alpha=**예시**, reg_lambda=**예시**,
-    #           gamma=**예시**, tree_method='hist', eval_metric='auc', n_jobs=-1
-print("XGBoost 모델 정의 완료.")
-
-
-# -- 파이프라인 (벡터라이저까지 캡슐화: 누수 방지) --
-pipe_log_reg_model = Pipeline([("vec", vec_hash_35),      ("clf", log_reg_model)])     # 또는 vec_tfidf_linear
-pipe_svc_model     = Pipeline([("vec", vec_hash_35),      ("clf", svc_model)])         # 확률 출력 OK
-pipe_rf_model      = Pipeline([("vec", vec_tfidf_tree),   ("svd", svd_300), ("clf", rf_model)])  # 트리+SVD 권장
-pipe_lgbm_model    = Pipeline([("vec", vec_tfidf_tree),   ("clf", lgbm_model)])        # LGBM은 SVD 생략 예시
-pipe_xgb_model     = Pipeline([("vec", vec_tfidf_tree),   ("svd", svd_300), ("clf", xgb_model)])
-
-# 한 번에 돌리기 쉽게 딕셔너리로 관리
-pipelines = {
-    "log_reg_model": pipe_log_reg_model,
-    "svc_model":     pipe_svc_model,
-    "rf_model":      pipe_rf_model,
-    "lgbm_model":    pipe_lgbm_model,
-    "xgb_model":     pipe_xgb_model,
-}
-
-# --- 교차 검증 (Cross-Validation)으로 모든 모델 평가 ---
-print("\n--- 모든 모델 교차 검증 시작 ---")
-
-# StratifiedKFold를 사용하여 레이블 비율을 유지하며 5-fold 교차 검증 수행
-skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-
-# 모델별 결과를 저장할 딕셔너리
-results = {}
-
-def ensure_text_series(x):
-    import pandas as pd
-    s = pd.Series(x)      # (N,), (N,1), 리스트/ndarray 모두 1차원 Series로 통일
-    s = s.fillna('')      # NaN -> 빈 문자열
-    s = s.astype(str)     # 전부 문자열화 (숫자/객체 섞임 방지)
-    return s
-
-# 모델별 스코어(확률/결정함수) 안전 추출
-def get_scores(trained_pipeline, X_val_series):
-    if hasattr(trained_pipeline, "predict_proba"):
-        return trained_pipeline.predict_proba(X_val_series)[:, 1]
-    elif hasattr(trained_pipeline, "decision_function"):
-        return trained_pipeline.decision_function(X_val_series)
+    # ---- XGBoost 파라미터 (GPU 저메모리 세팅) ----
+    xgb_params = {
+        "objective": "binary:logistic",
+        "eval_metric": "auc",
+        "max_depth": 6,
+        "learning_rate": 0.1,
+        "subsample": 0.6,
+        "colsample_bytree": 0.2,
+        "max_bin": MAX_BIN,       # ★ 부스터 파라미터
+        "nthread": 1,
+        "random_state": 42,
+    }
+    if version.parse(xgb.__version__) >= version.parse("2.0.0"):
+        xgb_params.update(device="cuda", tree_method="hist")
     else:
-        # 정말 없으면 분류 라벨로 대체 (AUC엔 비권장, 임시용)
-        return trained_pipeline.predict(X_val_series)
-    
-# 딕셔너리에 있는 모든 파이프라인 순회
-for name, pipeline in pipelines.items():
-    print(f"\n모델 훈련 시작: {name}")
-    
-    # OOF(Out-Of-Fold) 예측을 저장할 리스트
-    oof_preds_proba = []
-    oof_labels = []
+        xgb_params.update(tree_method="gpu_hist", predictor="gpu_predictor", gpu_id=0)
+    print("[DBG] XGB params:", xgb_params)
 
-    # 교차 검증
-    for i, (train_index, val_index) in enumerate(skf.split(X, y)):
-        print(f"  - Fold {i+1} / 5")
-        
-        X_train, X_val = X.iloc[train_index], X.iloc[val_index]
-        y_train, y_val = y.iloc[train_index], y.iloc[val_index]
-        
-        X_train_safe = ensure_text_series(X_train)
-        X_val_safe   = ensure_text_series(X_val)
+    # ---- 5-Fold + GPU 모니터 + QuantileDMatrix(ref + max_bin 일치) ----
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    oof_preds, oof_y = [], []
+    print("\n--- XGBoost(GPU) 5-Fold 시작 ---")
+    for fold, (tr, va) in enumerate(skf.split(X_all, y.values), 1):
+        print(f"[RUN] Fold {fold}/5  (train={len(tr):,}, valid={len(va):,})")
+        Xtr, Xva = X_all[tr], X_all[va]
+        ytr, yva = y.values[tr], y.values[va]
 
-        # 파이프라인을 훈련 데이터로 학습
-        pipeline.fit(X_train_safe, y_train)
-        
-        # 검증 데이터에 대한 예측 확률 계산
-        val_preds_proba = get_scores(pipeline, X_val_safe)
-        
-        # OOF 예측 및 레이블 추가
-        oof_preds_proba.extend(val_preds_proba)
-        oof_labels.extend(y_val)
-    
-    # 전체 OOF 예측에 대한 ROC-AUC 점수 계산
-    oof_score = roc_auc_score(oof_labels, oof_preds_proba)
-    results[name] = oof_score
-    
-    print(f"  -> {name} 평균 ROC-AUC: {oof_score:.4f}")
+        try:
+            # ★★ 핵심: QuantileDMatrix에도 동일한 max_bin 명시 + dvalid는 ref=dtrain
+            dtrain = xgb.QuantileDMatrix(Xtr, label=ytr, max_bin=MAX_BIN)
+            dvalid = xgb.QuantileDMatrix(Xva, label=yva, ref=dtrain, max_bin=MAX_BIN)
 
-# 최종 결과 출력
-print("\n--- 교차 검증 결과 요약 ---")
-for name, score in sorted(results.items(), key=lambda item: item[1], reverse=True):
-    print(f"{name:<15}: {score:.4f}")
-print("------------------------------")
+            mon = GPUMonitor(index=0, interval=0.5); mon.start()
+            bst = xgb.train(
+                xgb_params,
+                dtrain,
+                num_boost_round=300,
+                evals=[(dvalid, "valid")],
+                early_stopping_rounds=30,
+                verbose_eval=50,
+            )
+            p = bst.inplace_predict(Xva)  # 복사 없이 예측
+            mon.stop(prefix=f"[F{fold}] ")
 
+        except xgb.core.XGBoostError as e:
+            # GPU OOM 등 → CPU 폴백
+            if "cudaErrorMemoryAllocation" in str(e) or "bad allocation" in str(e):
+                print(f"[WARN][F{fold}] GPU OOM → CPU hist로 폴백합니다.")
+                cpu_params = dict(xgb_params); cpu_params.update(device="cpu")
+                dtrain = xgb.DMatrix(Xtr, label=ytr)
+                dvalid = xgb.DMatrix(Xva, label=yva)
+                bst = xgb.train(
+                    cpu_params,
+                    dtrain,
+                    num_boost_round=200,
+                    evals=[(dvalid, "valid")],
+                    early_stopping_rounds=20,
+                    verbose_eval=50,
+                )
+                p = bst.predict(dvalid)
+            else:
+                raise
 
+        oof_preds.append(p); oof_y.append(yva)
+
+    from numpy import concatenate as cat
+    auc = roc_auc_score(cat(oof_y), cat(oof_preds))
+    print(f"\n--- 결과 요약 ---\nXGBoost OOF ROC-AUC: {auc:.4f}")
+
+if __name__ == "__main__":
+    main()
